@@ -40,7 +40,6 @@ from .sources import MagneticDipole as MagneticDipoleUser
 from .sources import TransmissionLine as TransmissionLineUser
 from .sources import VoltageSource as VoltageSourceUser
 from .sources import DiscretePlaneWave as DiscretePlaneWaveUser
-from .sources import TFSFBox as TFSFBoxUser
 from .subgrids.grid import SubGridBaseGrid
 from .utilities.utilities import round_value
 from .waveforms import Waveform as WaveformUser
@@ -728,50 +727,36 @@ Add the UserMultiObject Class for the Discrete Plane Wave Implementation
 class DiscretePlaneWave(UserObjectMulti):
     """
     Specifies a plane wave implemented using the discrete plane wave formulation.
-
-    __________________________
-    
-    Instance variables:
-    --------------------------
-        x_length, double    : stores the length along the x axis of the TFSF box
-        y_length, double    : stores the length along the y axis of the TFSF box
-        z_length, double    : stores the length along the z axis of the TFSF box
-        time_duration, int  : stores the number of time steps over which the FDTD simulation is run
-        dx, double          : stores the discretization of the x component of the TFSF box
-        dy, double          : stores the discretixation of the y component of the TFSF box
-        dz, double          : stores the discretization of the z component of the TFSF box
-        dt, double          : stores the time step discretization for the FDTD simulation
-        corners, int array  : stores the coordinates of the cornets of the total field/scattered field boundaries
-        noOfWaves, int      : store the number of waves in the TFSF box in case there are multiple plane waves incident
-        snapshot, int       : stores the interval after which a snapshot of the request fields is recorded
-        ppw, double         : stores the number of points per wavelength for the requested source
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.order = 6
+        self.order = 19
         self.hash = "#discrete_plane_wave"
 
     def create(self, grid, uip):
         try:
             theta = self.kwargs["theta"]
-            dtheta = self.kwargs["delta_theta"]
             phi = self.kwargs["phi"]
-            dphi = self.kwargs["delta_phi"]
             psi = self.kwargs["psi"]
             p1 = self.kwargs["p1"]
             p2 = self.kwargs["p2"]
             waveform_id = self.kwargs["waveform_id"]
         except KeyError:
-            logger.exception(f"{self.params_str()} requires at least eight parameters.")
+            logger.exception(f"{self.params_str()} requires at least ten parameters.")
             raise
+        try:
+            dtheta = self.kwargs["delta_theta"]
+            dphi = self.kwargs["delta_phi"]
+        except KeyError:
+            dtheta = 1.0
+            dphi = 1.0
         
         # Warn about using a discrete plane wave on GPU
         if config.sim_config.general["solver"] in ["cuda", "opencl"]:
             logger.exception(
                 f"{self.params_str()} cannot currently be used "
-                + "with the CUDA or OpenCL-based solver. Consider "
-                + "using a #voltage_source instead."
+                + "with the CUDA or OpenCL-based solver. "
             )
             raise ValueError
 
@@ -779,14 +764,70 @@ class DiscretePlaneWave(UserObjectMulti):
         if not any(x.ID == waveform_id for x in grid.waveforms):
             logger.exception(f"{self.params_str()} there is no waveform " + f"with the identifier {waveform_id}.")
             raise ValueError
+        if (theta > 180):
+            theta -= (np.floor(theta/180) * 180.0)
+        if (phi > 360):
+            phi -= (np.floor(phi/360) * 360.0)
+        if (psi > 360):
+            psi -= (np.floor(psi/360) * 360.0)
 
+        x_start, y_start, z_start = uip.check_src_rx_point(p1, self.params_str())
+        x_stop, y_stop, z_stop = uip.check_src_rx_point(p2, self.params_str())
 
         DPW = DiscretePlaneWaveUser(grid)
-        DPW.corners = np.array([p1[0], p1[1], p1[2], p2[0], p2[1], p2[2]])
-        DPW.initDiscretePlaneWave(psi, phi, dphi, theta, dtheta, grid)
-        DPW.initialize1DGrid(grid)
+        DPW.corners = np.array([x_start, y_start, z_start, x_stop, y_stop, z_stop], dtype=np.int32)
+        DPW.waveformID = waveform_id
+        DPW.initializeDiscretePlaneWave(psi, phi, dphi, theta, dtheta, grid)
+
+        try:
+            DPW.material_ID = self.kwargs["material_id"]
+        except KeyError:
+            DPW.material_ID = 1
+
+        try:
+            # Check source start & source remove time parameters
+            start = self.kwargs["start"]
+            stop = self.kwargs["stop"]
+            if start < 0:
+                logger.exception(
+                    self.params_str() + (" delay of the initiation " "of the source should not " "be less than zero."))
+                raise ValueError
+            if stop < 0:
+                logger.exception(self.params_str() + (" time to remove the " "source should not be " "less than zero."))
+                raise ValueError
+            if stop - start <= 0:
+                logger.exception(self.params_str() + (" duration of the source " "should not be zero or " "less."))
+                raise ValueError
+            DPW.start = start
+            DPW.stop = min(stop, grid.timewindow)
+            startstop = f" start time {t.start:g} secs, finish time " + f"{t.stop:g} secs "
+        except KeyError:
+            DPW.start = 0
+            DPW.stop = grid.timewindow
+            startstop = " "
+
+        DPW.calculate_waveform_values(grid)
+        
+        logger.info(
+            f"{self.grid_name(grid)} Discrete Plane Wave within the TFSF Box " 
+            + f"spanning from {p1} m to {p2} m, incident in the direction "
+            + f"theta {theta} degrees and phi {phi} degrees "
+            + startstop
+            + f"using waveform {DPW.waveformID} created."
+        )
+        phi_approx = np.arctan2(DPW.m[1]/grid.dy, DPW.m[0]/grid.dx)*180/np.pi
+        theta_approx = np.arctan2( np.sqrt( (DPW.m[0]/grid.dx)*(DPW.m[0]/grid.dx) + (DPW.m[1]/grid.dy)*(DPW.m[1]/grid.dy) ),
+                                      DPW.m[2]/grid.dz) * 180/np.pi
+        logger.info(
+            f"Since {self.grid_name(grid)} Discrete Plane Wave has been discretized "
+            + f"the angles have been approzimated to the nearest rational angles "
+            + f"with some small tolerance levels. The chosen rational integers are "
+            + f"[m_x, m_y, m_z] : {DPW.m[-1]}. The approximated angles are : \n"
+            + "Approximated Phi : {:.3f}".format(phi_approx) + "\nApproximated Theta : {:.3f} .".format(theta_approx)
+        )
 
         grid.discreteplanewaves.append(DPW)
+
         '''
         DPW = []
         start = time.time()
